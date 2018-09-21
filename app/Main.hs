@@ -1,3 +1,5 @@
+{-# LANGUAGE ExistentialQuantification #-}
+
 module Main where
 
 import Text.ParserCombinators.Parsec hiding (spaces)
@@ -8,6 +10,8 @@ import Control.Monad.Except
 import Data.List
 import Data.Char
 import Data.Maybe
+import Data.IORef
+import System.IO
 
 
 symbol :: Parser Char
@@ -41,6 +45,12 @@ data LispError = NumArgs Integer [LispVal]
 instance Show LispError where show = showError
 
 type ThrowsError = Either LispError
+
+
+type Env = IORef [(String, IORef LispVal)]
+
+
+type IOThrowsError = ExceptT LispError IO
 
 
 parseString :: Parser LispVal
@@ -245,6 +255,12 @@ primitives = [ ("+", numericBinop (+))
              , ("string>?", strBoolBinop (>))
              , ("string<=?", strBoolBinop (<=))
              , ("string>=?", strBoolBinop (>=))
+             , ("car", car)
+             , ("cdr", cdr)
+             , ("cons", cons)
+             , ("eq?", eqv)
+             , ("eqv?", eqv)
+             , ("equal?", equal)
              ]
 
 numericBinop :: (Integer -> Integer -> Integer) -> [LispVal] -> ThrowsError LispVal
@@ -332,16 +348,77 @@ eqv [Atom arg1, Atom arg2] = return $ Bool $ arg1 == arg2
 eqv [DottedList xs x, DottedList ys y] = eqv [List $ xs ++ [x], List $ ys ++ [y]]
 eqv [List arg1, List arg2] = return $ Bool $
                                  (length arg1 == length arg2)
-                                 && all eqvPair (zip arg1 arg2)
-  where eqvPair (x1, x2) = case eqv [x1, x2] of
+                                 && and (zipWith eqvPair arg1 arg2)
+  where eqvPair x1 x2 = case eqv [x1, x2] of
           Left _ -> False
           Right (Bool val) -> val
           _ -> error "code path should be unreachable"
 eqv [_, _] = return $ Bool False
 eqv badArgList = throwError $ NumArgs 2 badArgList
 
+
+data Unpacker = forall a. Eq a => AnyUnpacker (LispVal -> ThrowsError a)
+
+
+unpackers :: [Unpacker]
+unpackers = [AnyUnpacker unpackNum, AnyUnpacker unpackStr, AnyUnpacker unpackBool]
+
+unpackEquals :: LispVal -> LispVal -> Unpacker -> ThrowsError Bool
+unpackEquals arg1 arg2 (AnyUnpacker unpacker) =
+  do unpacked1 <- unpacker arg1
+     unpacked2 <- unpacker arg2
+     catchError (return $ unpacked1 == unpacked2) (const $ return False)
+
+
+equal :: [LispVal] -> ThrowsError LispVal
+equal [arg1, arg2] = do
+  primitiveEquals <- or <$> mapM (unpackEquals arg1 arg2) unpackers
+  eqvEquals <- eqv [arg1, arg2]
+  return $ Bool (primitiveEquals || let (Bool x) = eqvEquals in x)
+equal badArgList = throwError $ NumArgs 2 badArgList
+
+
+flushStr :: String -> IO ()
+flushStr str = putStr str >> hFlush stdout
+
+
+readPrompt :: String -> IO String
+readPrompt prompt = flushStr prompt >> getLine
+
+
+evalString :: String -> IO String
+evalString expr = return $ extractValue $ trapError (show <$> (readExpr expr >>= eval))
+
+
+evalAndPrint :: String -> IO ()
+evalAndPrint expr = evalString expr >>= putStrLn
+
+
+until_ :: Monad m => (a -> Bool) -> m a -> (a -> m ()) -> m ()
+until_ predicate prompt action = do
+  result <- prompt
+  if predicate result
+    then return ()
+    else action result >> until_ predicate prompt action
+
+
+runRepl :: IO ()
+runRepl = until_ (== "quit") (readPrompt "Lisp>>> ") evalAndPrint
+
+
+nullEnv :: IO Env
+nullEnv = newIORef []
+
+
+liftThrows :: ThrowsError a -> IOThrowsError a
+liftThrows (Left err) = throwError err
+liftThrows (Right val) = return val
+
+
 main :: IO ()
 main = do
   args <- getArgs
-  let evaled = fmap show $ readExpr (head args) >>= eval
-  putStrLn $ extractValue $ trapError evaled
+  case length args of
+    0 -> runRepl
+    1 -> evalAndPrint (head args)
+    _ -> putStrLn "Program takes only 0 or 1 argument"
