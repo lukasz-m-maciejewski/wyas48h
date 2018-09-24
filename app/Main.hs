@@ -415,6 +415,14 @@ liftThrows (Left err) = throwError err
 liftThrows (Right val) = return val
 
 
+runIOThrows :: IOThrowsError String -> IO String
+runIOThrows action = extractValue <$> runExceptT (trapError action)
+
+
+isBound :: Env -> String -> IO Bool
+isBound envRef var = readIORef envRef >>= return . maybe False (const True) . lookup var
+
+
 main :: IO ()
 main = do
   args <- getArgs
